@@ -62,8 +62,8 @@ class UCCLTensorTransport(TensorTransportManager):
 
     @staticmethod
     def is_one_sided() -> bool:
-        # UCCL supports dual-sided transport, but let us start from supporting one-sided transport first
-        return True
+        # send/recv in UCCL are two-sided
+        return False
 
     @staticmethod
     def can_abort_transport() -> bool:
@@ -84,6 +84,7 @@ class UCCLTensorTransport(TensorTransportManager):
         if ray_gpu_ids:
             # Important: Use local CUDA device index (0), not Ray's physical GPU ID
             # Ray sets CUDA_VISIBLE_DEVICES, so the assigned GPU is always device 0 locally
+            # TODO: verify if this is the correct way.
             local_gpu_idx = 0
         else:
             local_gpu_idx = 0
@@ -251,27 +252,23 @@ class UCCLTensorTransport(TensorTransportManager):
 
             # Get local info
             local_metadata = endpoint.get_metadata()
+
             local_ip, _local_port, local_gpu = Endpoint.parse_metadata(local_metadata)
             local_hostname = socket.gethostname()
             sender_hostname = socket.getfqdn(sender_ip)
 
-            # Get local Ray physical GPU ID
-            local_ray_gpu_ids = ray.get_gpu_ids()
-            local_ray_physical_gpu_id = local_ray_gpu_ids[0] if local_ray_gpu_ids else None
-
-            # Determine if IPC (same machine, same physical GPU)
+            # Determine if IPC (same machine)
+            # Use IPC for all same-machine connections to avoid RDMA NIC routing issues
             same_machine = (sender_ip == local_ip or sender_ip == "127.0.0.1" or local_hostname == sender_hostname)
-            if sender_ray_physical_gpu_id is not None and local_ray_physical_gpu_id is not None:
-                is_ipc = same_machine and (sender_ray_physical_gpu_id == local_ray_physical_gpu_id)
-            else:
-                is_ipc = same_machine and (sender_gpu == local_gpu)
+            is_ipc = same_machine
 
-            self.logger.info(f"[UCCL Receiver] DEBUG ON! Using {'IPC' if is_ipc else 'RDMA'} for receiving")
+            self.logger.info(f"[UCCL Receiver] Using {'IPC' if is_ipc else 'RDMA'} for receiving (sender_ip={sender_ip}, local_ip={local_ip})")
+
             if is_ipc:
                 # IPC: Accept connection from local sender (receiver waits for sender)
-                self.logger.info(f"[UCCL Receiver] Waiting for IPC connection from sender...")
+                self.logger.info(f"[UCCL Receiver] Waiting for IPC connection from sender on GPU {local_gpu}...")
                 ok, remote_gpu_idx, conn_id = endpoint.accept_local()
-                self.logger.info(f"[UCCL Receiver] IPC connection accepted from GPU {remote_gpu_idx}, conn_id={conn_id}")
+                self.logger.info(f"[UCCL Receiver] Accepted IPC connection: ok={ok}, remote_gpu={remote_gpu_idx}, conn_id={conn_id}")
                 if not ok:
                     raise RuntimeError(f"[UCCL Receiver] Failed to accept IPC connection from sender")
 
@@ -282,7 +279,6 @@ class UCCLTensorTransport(TensorTransportManager):
                     self.logger.info(f"[UCCL Receiver] Receiving tensor {i} via IPC: size={size} bytes")
                     ok, transfer_id = endpoint.recv_ipc_async(conn_id, ptr, size)
                     if not ok:
-                        self.logger.error(f"[UCCL Receiver] Failed to initiate IPC recv for tensor {i}")
                         raise RuntimeError(f"[UCCL Receiver] Failed to initiate IPC recv for tensor {i}")
                     transfer_handles.append(transfer_id)
             else:
@@ -375,7 +371,9 @@ class UCCLTensorTransport(TensorTransportManager):
         from uccl.p2p import Endpoint
         import socket
 
-        receiver_ip, _receiver_port, receiver_gpu = Endpoint.parse_metadata(receiver_endpoint_metadata)
+        self.logger.info(f"[UCCL Sender] Parsing receiver metadata: {receiver_endpoint_metadata!r}")
+        receiver_ip, receiver_port, receiver_gpu = Endpoint.parse_metadata(receiver_endpoint_metadata)
+        self.logger.info(f"[UCCL Sender] Parsed receiver info: IP={receiver_ip}, port={receiver_port}, GPU={receiver_gpu}")
 
         # Get local info
         local_metadata = endpoint.get_metadata()
@@ -387,22 +385,20 @@ class UCCLTensorTransport(TensorTransportManager):
         local_ray_gpu_ids = ray.get_gpu_ids()
         local_ray_physical_gpu_id = local_ray_gpu_ids[0] if local_ray_gpu_ids else None
 
-        # Determine if IPC (same machine, same physical GPU)
+        # Determine if IPC (same machine)
+        # Use IPC for all same-machine connections to avoid RDMA NIC routing issues
         same_machine = (receiver_ip == local_ip or receiver_ip == "127.0.0.1" or local_hostname == receiver_hostname)
-        if receiver_ray_physical_gpu_id is not None and local_ray_physical_gpu_id is not None:
-            is_ipc = same_machine and (receiver_ray_physical_gpu_id == local_ray_physical_gpu_id)
-        else:
-            is_ipc = same_machine and (receiver_gpu == local_gpu)
+        is_ipc = same_machine
 
-        self.logger.info(f"[UCCL Sender] Using {'IPC' if is_ipc else 'RDMA'} for sending")
+        self.logger.info(f"[UCCL Sender] Using {'IPC' if is_ipc else 'RDMA'} for sending (receiver_ip={receiver_ip}, local_ip={local_ip})")
 
         transfer_handles = []
-
         try:
             if is_ipc:
                 # IPC: Connect to local receiver (sender connects after receiver is ready)
-                self.logger.info(f"[UCCL Sender] Connecting to receiver via IPC on GPU {receiver_gpu}...")
+                self.logger.info(f"[UCCL Sender] Connecting to receiver via IPC on GPU {receiver_gpu} (sender on GPU {local_gpu})...")
                 ok, conn_id = endpoint.connect_local(receiver_gpu)
+                self.logger.info(f"[UCCL Sender] IPC connect result: ok={ok}, conn_id={conn_id}")
                 if not ok:
                     raise RuntimeError(f"[UCCL Sender] Failed to connect via IPC to receiver on GPU {receiver_gpu}")
                 self.logger.info(f"[UCCL Sender] IPC connection successful, conn_id={conn_id}")
@@ -418,10 +414,12 @@ class UCCLTensorTransport(TensorTransportManager):
                     transfer_handles.append(transfer_id)
             else:
                 # RDMA: Connect to remote receiver (sender connects after receiver is ready)
-                self.logger.info(f"[UCCL Sender] Connecting to receiver at {receiver_ip}, GPU {receiver_gpu}...")
-                ok, conn_id = endpoint.connect(receiver_ip, receiver_gpu, remote_port=_receiver_port)
+                if not receiver_port or receiver_port == 0:
+                    raise RuntimeError(f"[UCCL Sender] Invalid receiver port: {receiver_port}. Metadata may be corrupted or endpoint not initialized.")
+                self.logger.info(f"[UCCL Sender] Connecting to receiver at {receiver_ip}:{receiver_port}, GPU {receiver_gpu}...")
+                ok, conn_id = endpoint.connect(receiver_ip, receiver_gpu, remote_port=receiver_port)
                 if not ok:
-                    raise RuntimeError(f"[UCCL Sender] Failed to connect to receiver at {receiver_ip}:{_receiver_port}, GPU {receiver_gpu}")
+                    raise RuntimeError(f"[UCCL Sender] Failed to connect to receiver at {receiver_ip}:{receiver_port}, GPU {receiver_gpu}")
                 self.logger.info(f"[UCCL Sender] RDMA connection successful, conn_id={conn_id}")
 
                 # Send tensors via RDMA using pre-registered memory

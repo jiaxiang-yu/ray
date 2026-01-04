@@ -245,6 +245,7 @@ class UCCLTensorTransport(TensorTransportManager):
             # Parse sender's endpoint info
             from uccl.p2p import Endpoint
             import socket
+            self.logger.info(f"[UCCL Receiver] DEBUG ON!")
 
             sender_ip, sender_port, sender_gpu = Endpoint.parse_metadata(sender_endpoint_metadata)
 
@@ -265,25 +266,32 @@ class UCCLTensorTransport(TensorTransportManager):
             else:
                 is_ipc = same_machine and (sender_gpu == local_gpu)
 
+            self.logger.info(f"[UCCL Receiver] DEBUG ON! Using {'IPC' if is_ipc else 'RDMA'} for receiving")
             if is_ipc:
-                # IPC: Connect to local sender
-                ok, conn_id = endpoint.connect_local(sender_gpu)
+                # IPC: Accept connection from local sender (receiver waits for sender)
+                self.logger.info(f"[UCCL Receiver] Waiting for IPC connection from sender...")
+                ok, remote_gpu_idx, conn_id = endpoint.accept_local()
+                self.logger.info(f"[UCCL Receiver] IPC connection accepted from GPU {remote_gpu_idx}, conn_id={conn_id}")
                 if not ok:
-                    raise RuntimeError(f"[UCCL Receiver] Failed to connect via IPC to local GPU {sender_gpu}")
+                    raise RuntimeError(f"[UCCL Receiver] Failed to accept IPC connection from sender")
 
                 # Receive tensors via IPC (no memory registration needed)
                 for i, tensor in enumerate(tensors):
                     ptr = tensor.data_ptr()
                     size = tensor.numel() * tensor.element_size()
+                    self.logger.info(f"[UCCL Receiver] Receiving tensor {i} via IPC: size={size} bytes")
                     ok, transfer_id = endpoint.recv_ipc_async(conn_id, ptr, size)
                     if not ok:
+                        self.logger.error(f"[UCCL Receiver] Failed to initiate IPC recv for tensor {i}")
                         raise RuntimeError(f"[UCCL Receiver] Failed to initiate IPC recv for tensor {i}")
                     transfer_handles.append(transfer_id)
             else:
-                # RDMA: Connect to remote sender
-                ok, conn_id = endpoint.connect(sender_ip, sender_gpu, remote_port=sender_port)
+                # RDMA: Accept connection from remote sender (receiver waits for sender)
+                self.logger.info(f"[UCCL Receiver] Waiting for RDMA connection from sender at {sender_ip}:{sender_port}...")
+                ok, remote_ip, remote_gpu, conn_id = endpoint.accept()
+                self.logger.info(f"[UCCL Receiver] RDMA connection accepted from {remote_ip}, GPU {remote_gpu}, conn_id={conn_id}")
                 if not ok:
-                    raise RuntimeError(f"[UCCL Receiver] Failed to connect to remote endpoint at {sender_ip}:{sender_port} (GPU {sender_gpu})")
+                    raise RuntimeError(f"[UCCL Receiver] Failed to accept RDMA connection from sender")
 
                 # Register local memory for RDMA receive
                 for tensor in tensors:
@@ -392,12 +400,12 @@ class UCCLTensorTransport(TensorTransportManager):
 
         try:
             if is_ipc:
-                # IPC: Wait for local connection from receiver
-                self.logger.info(f"[UCCL Sender] Waiting for local IPC connection...")
-                ok, remote_gpu_idx, conn_id = endpoint.accept_local()
+                # IPC: Connect to local receiver (sender connects after receiver is ready)
+                self.logger.info(f"[UCCL Sender] Connecting to receiver via IPC on GPU {receiver_gpu}...")
+                ok, conn_id = endpoint.connect_local(receiver_gpu)
                 if not ok:
-                    raise RuntimeError("[UCCL Sender] Failed to accept local IPC connection")
-                self.logger.info(f"[UCCL Sender] Accepted IPC connection from GPU {remote_gpu_idx}, conn_id={conn_id}")
+                    raise RuntimeError(f"[UCCL Sender] Failed to connect via IPC to receiver on GPU {receiver_gpu}")
+                self.logger.info(f"[UCCL Sender] IPC connection successful, conn_id={conn_id}")
 
                 # Send tensors via IPC
                 for i, tensor in enumerate(tensors):
@@ -409,12 +417,12 @@ class UCCLTensorTransport(TensorTransportManager):
                         raise RuntimeError(f"[UCCL Sender] Failed to initiate IPC send for tensor {i}")
                     transfer_handles.append(transfer_id)
             else:
-                # RDMA: Wait for remote connection from receiver
-                self.logger.info(f"[UCCL Sender] Waiting for RDMA connection...")
-                ok, remote_ip, remote_gpu, conn_id = endpoint.accept()
+                # RDMA: Connect to remote receiver (sender connects after receiver is ready)
+                self.logger.info(f"[UCCL Sender] Connecting to receiver at {receiver_ip}, GPU {receiver_gpu}...")
+                ok, conn_id = endpoint.connect(receiver_ip, receiver_gpu, remote_port=_receiver_port)
                 if not ok:
-                    raise RuntimeError("[UCCL Sender] Failed to accept RDMA connection")
-                self.logger.info(f"[UCCL Sender] Accepted RDMA connection from {remote_ip} GPU={remote_gpu}, conn_id={conn_id}")
+                    raise RuntimeError(f"[UCCL Sender] Failed to connect to receiver at {receiver_ip}:{_receiver_port}, GPU {receiver_gpu}")
+                self.logger.info(f"[UCCL Sender] RDMA connection successful, conn_id={conn_id}")
 
                 # Send tensors via RDMA using pre-registered memory
                 for i, (mr_id, ptr) in enumerate(zip(mr_ids, tensor_ptrs)):

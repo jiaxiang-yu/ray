@@ -194,11 +194,13 @@ class GPUObjectStore:
         # Signal when an object is freed from the object store.
         self._object_freed_cv = threading.Condition(self._lock)
 
-        # These are only used for NIXL. Will be removed in the future.
-        # Mapping from object ID to the NIXL managed meta.
-        self._managed_meta_nixl: Dict[str, Any] = {}
-        # Mapping from NIXL managed meta to the number of objects that contain it.
-        self._managed_meta_counts_nixl: Dict[Any, int] = defaultdict[Any, int](int)
+        # Generic metadata management for all transport backends (NIXL, UCCL, etc.)
+        # Structure: _managed_meta[backend][obj_id] = meta
+        self._managed_meta: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        # Structure: _managed_meta_counts[backend][meta] = count
+        self._managed_meta_counts: Dict[str, Dict[Any, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
 
     def has_object(self, obj_id: str) -> bool:
         with self._lock:
@@ -307,34 +309,66 @@ class GPUObjectStore:
                     return dst_obj_id
             return None
 
-    def record_managed_meta_nixl(self, obj_id: str, meta: Any):
-        """Record the NIXL managed meta for the given object ID."""
+    def record_managed_meta(self, backend: str, obj_id: str, meta: Any):
+        """Record the managed metadata for the given object ID and backend.
+
+        Args:
+            backend: The transport backend (e.g., "NIXL", "UCCL").
+            obj_id: The object ID.
+            meta: The metadata to record.
+        """
         with self._lock:
-            self._managed_meta_nixl[obj_id] = meta
-            self._managed_meta_counts_nixl[meta] += 1
+            self._managed_meta[backend][obj_id] = meta
+            self._managed_meta_counts[backend][meta] += 1
 
     def record_and_get_meta_if_duplicate(
         self, src_obj_id: str, src_gpu_object: List["torch.Tensor"]
     ) -> Optional[str]:
-        """Record the NIXL managed meta for the given object ID if it is a duplicate of another object, and return the meta if it is."""
+        """Record the managed meta for the given object ID if it is a duplicate of another object, and return the meta if it is.
+
+        Note: This method is backend-agnostic and searches across all backends.
+        """
         with self._lock:
             duplicate_obj_id = self.get_duplicate_objects(src_obj_id, src_gpu_object)
             if duplicate_obj_id is not None:
-                meta = self._managed_meta_nixl[duplicate_obj_id]
-                self._managed_meta_counts_nixl[meta] += 1
-                self._managed_meta_nixl[src_obj_id] = meta
-                return meta
+                # Search for the metadata in any backend
+                for backend in self._managed_meta:
+                    if duplicate_obj_id in self._managed_meta[backend]:
+                        meta = self._managed_meta[backend][duplicate_obj_id]
+                        self._managed_meta_counts[backend][meta] += 1
+                        self._managed_meta[backend][src_obj_id] = meta
+                        return meta
             return None
 
-    def remove_managed_meta_nixl(self, obj_id: str):
-        """Remove the NIXL managed meta for the given object ID and return the count of the managed meta after removal."""
+    def remove_managed_meta(self, backend: str, obj_id: str) -> int:
+        """Remove the managed metadata for the given object ID and backend.
+
+        Args:
+            backend: The transport backend (e.g., "NIXL", "UCCL").
+            obj_id: The object ID.
+
+        Returns:
+            The reference count of the metadata after removal.
+        """
         with self._lock:
-            meta = self._managed_meta_nixl.pop(obj_id)
-            self._managed_meta_counts_nixl[meta] -= 1
-            count = self._managed_meta_counts_nixl[meta]
+            meta = self._managed_meta[backend].pop(obj_id)
+            self._managed_meta_counts[backend][meta] -= 1
+            count = self._managed_meta_counts[backend][meta]
             if count <= 0:
-                self._managed_meta_counts_nixl.pop(meta)
+                self._managed_meta_counts[backend].pop(meta)
             return count
+
+    def get_num_managed_meta(self, backend: str) -> int:
+        """Return the number of managed metadata entries for a given backend.
+
+        Args:
+            backend: The transport backend (e.g., "NIXL", "UCCL").
+
+        Returns:
+            The number of metadata entries.
+        """
+        with self._lock:
+            return len(self._managed_meta.get(backend, {}))
 
     def wait_and_pop_object(
         self, obj_id: str, timeout: Optional[float] = None
@@ -417,9 +451,15 @@ class GPUObjectStore:
             # Count total objects across all queues
             return sum(len(queue) for queue in self._gpu_object_store.values())
 
+    # Backward compatibility methods for NIXL (deprecated)
+    def record_managed_meta_nixl(self, obj_id: str, meta: Any):
+        """Deprecated: Use record_managed_meta("NIXL", obj_id, meta) instead."""
+        self.record_managed_meta("NIXL", obj_id, meta)
+
+    def remove_managed_meta_nixl(self, obj_id: str) -> int:
+        """Deprecated: Use remove_managed_meta("NIXL", obj_id) instead."""
+        return self.remove_managed_meta("NIXL", obj_id)
+
     def get_num_managed_meta_nixl(self) -> int:
-        """
-        Return the number of NIXL managed meta in the GPU object store.
-        """
-        with self._lock:
-            return len(self._managed_meta_nixl)
+        """Deprecated: Use get_num_managed_meta("NIXL") instead."""
+        return self.get_num_managed_meta("NIXL")

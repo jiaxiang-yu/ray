@@ -7,6 +7,9 @@ from ray.experimental.gpu_object_manager.collective_tensor_transport import (
 from ray.experimental.gpu_object_manager.nixl_tensor_transport import (
     NixlTensorTransport,
 )
+from ray.experimental.gpu_object_manager.uccl_tensor_transport import (
+    UCCLTensorTransport,
+)
 from ray.experimental.gpu_object_manager.tensor_transport_manager import (
     TensorTransportManager,
 )
@@ -18,12 +21,14 @@ if TYPE_CHECKING:
 # Class definitions for transport managers
 transport_manager_classes: dict[str, TensorTransportManager] = {
     "NIXL": NixlTensorTransport,
+    "UCCL": UCCLTensorTransport,
     "GLOO": CollectiveTensorTransport,
     "NCCL": CollectiveTensorTransport,
 }
 
 transport_devices = {
     "NIXL": ["cuda", "cpu"],
+    "UCCL": ["cuda", "cpu", "rocm"],
     "GLOO": ["cpu"],
     "NCCL": ["cuda"],
 }

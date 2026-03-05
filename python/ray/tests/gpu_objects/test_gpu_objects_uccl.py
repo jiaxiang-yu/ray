@@ -132,6 +132,7 @@ def test_p2p(ray_start_regular):
     result = dst_actor.sum.remote(ref, "cuda")
     assert tensor.sum().item() == ray.get(result)
 
+@pytest.mark.skip(reason="UCCl p2p engine is adding support for CPU to CPU transfer")
 @pytest.mark.parametrize("ray_start_regular", [{"num_gpus": 2}], indirect=True)
 def test_p2p_cpu_to_cpu(ray_start_regular):
     num_actors = 2

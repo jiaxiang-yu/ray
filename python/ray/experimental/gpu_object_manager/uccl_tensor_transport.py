@@ -361,12 +361,6 @@ class UCCLTensorTransport(TensorTransportManager):
         If a tensor is already registered (by data_ptr), its reference count is
         incremented. New tensors are registered one at a time so that duplicates
         within the same input list are detected immediately via the cache.
-
-        Unlike NIXL which registers at the storage level, UCCL registers each
-        tensor view individually — ep.register_memory([tensor]) returns a
-        descriptor for that specific view's data region. Using data_ptr() as
-        the key ensures each view gets its own descriptor, which is necessary
-        for correct transfer of overlapping views.
         """
         ep = self._get_uccl_endpoint()
         for tensor in tensors:
